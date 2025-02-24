@@ -1,0 +1,1 @@
+This solver, developed by Siyuan Li, addresses the 2D linear solid mechanics problem. It is primarily designed for teaching the fundamentals of the Finite Element Method (FEM) in solid mechanics, with the potential for extension to iteratively solve nonlinear solid mechanics problems.
