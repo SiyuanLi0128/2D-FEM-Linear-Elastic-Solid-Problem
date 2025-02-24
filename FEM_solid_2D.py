@@ -585,8 +585,6 @@ if __name__ == '__main__':
 
     u_func = u_function()
     v_func = v_function()
-    print(u_func(1, 0.5))
-    print(v_func(1, 1))
 
     linear_problem.generate_essential_condition(disp1_func=u_func, disp2_func=v_func)
     linear_problem.generate_natural_condition()
