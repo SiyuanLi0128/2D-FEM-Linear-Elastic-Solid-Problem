@@ -498,7 +498,6 @@ class LinearProblem2D:
 
     def plot_stress(self, savefig=False, x_target=0, y_target=0):
         Sig_x = self.stresses[:, 0]
-        print(np.max(Sig_x) - np.min(Sig_x), np.mean(Sig_x), np.std(Sig_x))
         Sig_y = self.stresses[:, 1]
         Tau_xy = self.stresses[:, 2]
 
@@ -507,17 +506,6 @@ class LinearProblem2D:
         xy = self.nodes
         x_coords = xy[:, 0]
         y_coords = xy[:, 1]
-
-        # 找到距离目标点最近的节点
-        distances = np.sqrt((x_coords - x_target) ** 2 + (y_coords - y_target) ** 2)
-        nearest_node_idx = np.argmin(distances)  # 最近节点的索引
-        nearest_node_x = x_coords[nearest_node_idx]
-        nearest_node_y = y_coords[nearest_node_idx]
-        nearest_node_Sig_x = Sig_x[nearest_node_idx]
-
-        # 输出最近节点的 Tau_xy 值
-        print(f"Nearest node to ({x_target}, {y_target}) is ({nearest_node_x}, {nearest_node_y})")
-        print(f"Sig_x at this node: {nearest_node_Sig_x}")
 
         # 绘制三角形的伪彩色图
         fig = plt.figure(figsize=(16.6, 5))
