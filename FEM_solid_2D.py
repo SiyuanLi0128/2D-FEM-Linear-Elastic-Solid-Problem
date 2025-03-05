@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib import tri
 from meshpy import triangle
-from scipy.sparse import lil_matrix
+from scipy.sparse import lil_matrix, coo_matrix
 from scipy.sparse.linalg import spsolve
 from shapely.geometry import Polygon, Point
 
@@ -20,36 +20,43 @@ class LinearProblem2D:
 
     def __init__(self,
                  Boundary_Nodes,
-                 Young_modulus,
-                 Poisson_ratio,
+                 Young_modulus=1.,
+                 Poisson_ratio=0.3,
+                 lmbd_func=None,
+                 mu_func=None,
                  max_area=20.0,
                  penalty=1e+4):
-        """
-            输入任意长度的边界节点数组，在它们围成的区域内均匀划分三角形单元。
-
-                参数:
-                - boundary_nodes: 二维数组，定义区域边界上的节点，用于确定求解区域
-                - max_area: float，控制生成网格的最大单元面积，越小则点越密集
-
-                返回:
-                - nodes: 二维数组，生成的节点
-                - elements: 二维数组，生成的三角形单元
-        """
-        self.Y_nodes = None
-        self.X_nodes = None
-        self.num_elements = None
-        self.num_nodes = None
-        self.elements = None
-        self.nodes = None
-        self.dist_mat = None
-        self.ess_bc = {}
-        self.nat_bc = {}
         self.constants = None
+        self.nodes = None
+        self.num_nodes = None
+        self.X_nodes = None
+        self.Y_nodes = None
+        self.elements = None
+        self.signed_area = None
+        self.area = None
+        self.num_elements = None
+        self.dist_mat = None
+        self.B = None
+        self.D = None
+        self.load_vector = None
+        self.K_mat = None
+        self.displacements = None
+        self.strains = None
+        self.stresses = None
+        self.ess_bc = np.empty((0, 3))
+        self.nat_bc = np.empty((0, 3))
+        self.bx = np.empty((0, 3))
+        self.by = np.empty((0, 3))
         self.boundary_nodes = Boundary_Nodes
         self.Young_modulus = Young_modulus  # 杨氏模量
         self.Poisson_ratio = Poisson_ratio  # 泊松比
+        self.lmbd_func = lmbd_func
+        self.mu_func = mu_func
         self.max_area = max_area
         self.penalty = penalty
+
+        self.lmbd = self.Young_modulus * self.Poisson_ratio / ((1 + self.Poisson_ratio) * (1 - 2 * self.Poisson_ratio))
+        self.mu = self.Young_modulus / (2 * (1 + self.Poisson_ratio))
 
     def set_elements(self, ):
         print('------------------------生成单元------------------------')
@@ -79,8 +86,20 @@ class LinearProblem2D:
         self.X_nodes = self.nodes[:, 0]
         self.Y_nodes = self.nodes[:, 1]
 
-        len_nodes = len(self.X_nodes)
-        dist_mat = lil_matrix((len_nodes, len_nodes))
+        element_nodes = self.nodes[self.elements]# 提取节点坐标
+        # Nodes 形状为 (n_elements, 3, 2)
+        x = element_nodes[:, :, 0]  # 形状为 (n_elements, 3)
+        y = element_nodes[:, :, 1]  # 形状为 (n_elements, 3)
+
+        # 计算带正负号的面积
+        self.signed_area = 0.5 * (
+                x[:, 0] * (y[:, 1] - y[:, 2]) +
+                x[:, 1] * (y[:, 2] - y[:, 0]) +
+                x[:, 2] * (y[:, 0] - y[:, 1])
+        )  # 形状为 (n_elements,)
+        self.area = np.abs(self.signed_area).reshape(-1, 1)
+
+        dist_mat = lil_matrix((self.num_nodes, self.num_nodes))
 
         X_ele = self.X_nodes[self.elements]
         Y_ele = self.Y_nodes[self.elements]
@@ -92,6 +111,13 @@ class LinearProblem2D:
         dist_mat[row_indices, col_indices] = distance.reshape(-1)
 
         self.dist_mat = dist_mat.tocsr()
+
+        num_dofs = self.num_nodes * 2
+        self.load_vector = np.zeros(num_dofs)
+
+        self.displacements = np.zeros((num_dofs, ))
+        self.stresses = np.zeros((self.num_elements, 3))
+        self.strains = np.zeros((self.num_elements, 3))
 
     def generate_nodes(self):
         return self.nodes
@@ -105,258 +131,289 @@ class LinearProblem2D:
         self.constants.update(constants)  # 更新而不是替换
 
     def generate_essential_condition(self,
-                                     disp1_func=lambda x, y: 0.,  # type of x and y is <class 'float'>
-                                     disp2_func=lambda x, y: 0.):
-        print('----------------------生成本质边界条件----------------------')
-        start = time.time()
-        condition1 = (self.X_nodes == 0.)
-        Idx1 = np.where(condition1)[0]
-        X_ess1 = self.X_nodes[Idx1]
-        Y_ess1 = self.Y_nodes[Idx1]
-        condition2 = (self.X_nodes == 1)
-        Idx2 = np.where(condition2)[0]
-        X_ess2 = self.X_nodes[Idx2]
-        Y_ess2 = self.Y_nodes[Idx2]
+                                     disp1_func,  # type of x and y is <class 'float'>
+                                     disp2_func,
+                                     x_condition=lambda x: x < np.inf,
+                                     y_condition=lambda y: y < np.inf,
+                                     couple_condition=lambda x, y: x < np.inf):
+        condition1 = x_condition(self.X_nodes)
+        condition2 = y_condition(self.Y_nodes)
+        condition3 = couple_condition(self.X_nodes, self.Y_nodes)
+        condition = condition1 & condition2 & condition3
 
-        """设置位移边界条件，形如 {node_id: [displacement_x, displacement_y]} (若自由边界则设置为None）"""
-        Ess_bc = {}
-        for idx, X, Y in zip(Idx1, X_ess1, Y_ess1):  # 施加位移荷载
-            X = X.item()
-            Y = Y.item()  # type(X) is <class 'float'>
-            Ess_bc[idx] = [disp1_func(X, Y), disp2_func(X, Y)]
-        for idx, X, Y in zip(Idx2, X_ess2, Y_ess2):
-            X = X.item()
-            Y = Y.item()  # type(X) is <class 'float'>
-            Ess_bc[idx] = [disp1_func(X, Y), disp2_func(X, Y)]
+        Idx_ess = np.where(condition)[0]
+        X_ess = self.X_nodes[Idx_ess]
+        Y_ess = self.Y_nodes[Idx_ess]
 
-        end = time.time()
-        t = end - start
-        print(f'生成本质边界条件耗时: {t:.4e}s')
-
-        self.ess_bc = Ess_bc
+        """设置位移边界条件，形如 {node_id: [displacement_x, displacement_y]} (若自由边界则设置为np.nan）"""
+        u_values = disp1_func(X_ess, Y_ess)  # 计算结果，可能包含 np.nan
+        v_values = disp2_func(X_ess, Y_ess)  # 计算结果，可能包含 np.nan
+        new_ess_bc = np.hstack((Idx_ess.reshape(-1, 1), u_values.reshape(-1, 1), v_values.reshape(-1, 1)))
+        self.ess_bc = np.vstack((self.ess_bc, new_ess_bc))
 
     def generate_natural_condition(self,
-                                   f_x=lambda x, y: 0.,  # type of x and y is <class 'float'>
-                                   f_y=lambda x, y: 0.):
+                                   fx_func,
+                                   fy_func,
+                                   x_condition=lambda x: x < np.inf,
+                                   y_condition=lambda y: y < np.inf,
+                                   couple_condition=lambda x, y: x < np.inf, ):
         print('----------------------生成自然边界条件----------------------')
         start = time.time()
-        condition = (self.X_nodes == 48.)
-        Idx = np.where(condition)[0]
-        X_nat = self.X_nodes[Idx]
-        Y_nat = self.Y_nodes[Idx]
+        condition1 = x_condition(self.X_nodes)
+        condition2 = y_condition(self.Y_nodes)
+        condition3 = couple_condition(self.X_nodes, self.Y_nodes)
+        condition = condition1 & condition2 & condition3
 
-        """设置力边界条件，形如 {node_id: [f_x, f_y]}"""
-        Nat_bc = {}
-        for idx, X, Y in zip(Idx, X_nat, Y_nat):  # 施加面力荷载
-            Nat_bc[idx] = np.array([0., 0.])
+        Idx_nat = np.where(condition)[0]
+        X_nat = self.X_nodes[Idx_nat]
+        Y_nat = self.Y_nodes[Idx_nat]
 
-            X = X.item()
-            Y = Y.item()
-            for x1, y1 in zip(X_nat, Y_nat):
-                for x2, y2 in zip(X_nat, Y_nat):
-                    id1 = np.where((self.X_nodes == x1) & (self.Y_nodes == y1))[0].item()
-                    id2 = np.where((self.X_nodes == x2) & (self.Y_nodes == y2))[0].item()
-                    grid_size = self.dist_mat[id1, id2]
-                    Nat_bc[idx] += (np.array([f_x(X, Y), f_y(X, Y)])  # f_x = f_x(X, Y), f_y = f_y(X, Y)
-                                    * (0.5 * grid_size))
+        """设置力边界条件，形如 [[node_id, f_x, f_y]...]"""
+        id1 = Idx_nat[:, np.newaxis].repeat(Idx_nat.size, axis=1)
+        id2 = Idx_nat[np.newaxis, :].repeat(Idx_nat.size, axis=0)
+        grid_sizes = self.dist_mat[id1, id2].sum(axis=0) * 0.5
+        f_x = np.multiply(grid_sizes, fx_func(X_nat, Y_nat))
+        f_y = np.multiply(grid_sizes, fy_func(X_nat, Y_nat))
+        new_nat_bc = np.hstack((Idx_nat.reshape(-1, 1), f_x.reshape(-1, 1), f_y.reshape(-1, 1)))
+
+        self.nat_bc = np.vstack((self.nat_bc, new_nat_bc))
 
         end = time.time()
         t = end - start
         print(f'生成自然边界条件耗时: {t:.4e}s')
-        self.nat_bc = Nat_bc
 
-    def compute_B_matrix(self, Nodes):
+    def compute_element_area(self, ele_Nodes):
+        # 提取节点坐标
+        # Nodes 形状为 (n_elements, 3, 2)
+        x = ele_Nodes[:, :, 0]  # 形状为 (n_elements, 3)
+        y = ele_Nodes[:, :, 1]  # 形状为 (n_elements, 3)
+
+        # 计算带正负号的面积
+        signed_area = 0.5 * (
+                x[:, 0] * (y[:, 1] - y[:, 2]) +
+                x[:, 1] * (y[:, 2] - y[:, 0]) +
+                x[:, 2] * (y[:, 0] - y[:, 1])
+        )  # 形状为 (n_elements,)
+        area = np.abs(signed_area).reshape(-1, 1)
+        return signed_area, area
+
+    def compute_B_matrix(self):
         """
-        计算单元应变矩阵 B (3 行 6 列)
+        计算单元应变矩阵 B
         """
-        x1, y1 = Nodes[0]
-        x2, y2 = Nodes[1]
-        x3, y3 = Nodes[2]
-        signed_area = 0.5 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2))  # 计算带正负号的三节点单元面积
-        factor = 1 / (2 * signed_area)
-        B = np.array([[y2 - y3, 0, y3 - y1, 0, y1 - y2, 0],
-                      [0, x3 - x2, 0, x1 - x3, 0, x2 - x1],
-                      [x3 - x2, y2 - y3, x1 - x3, y3 - y1, x2 - x1, y1 - y2]]) * factor
-        return B, abs(signed_area)  # 曾出错误：忘记面积取绝对值
+        ele_Nodes = self.nodes[self.elements]
+        n_elements = ele_Nodes.shape[0]
+
+        # 提取节点坐标
+        # Nodes 形状为 (n_elements, 3, 2)
+        x = ele_Nodes[:, :, 0]  # 形状为 (n_elements, 3)
+        y = ele_Nodes[:, :, 1]  # 形状为 (n_elements, 3)
+
+        # 计算带正负号的面积
+        signed_area, area = self.compute_element_area(ele_Nodes)  # 形状为 (n_elements,)
+        factor = 1 / (2 * signed_area)  # 形状为 (n_elements,)
+
+        # 计算差值
+        dy = np.roll(y, -1, axis=1) - np.roll(y, 1, axis=1)  # y2 - y3, y3 - y1, y1 - y2
+        dx = np.roll(x, 1, axis=1) - np.roll(x, -1, axis=1)  # x3 - x2, x1 - x3, x2 - x1
+
+        # 构造 B 矩阵
+        B = np.zeros((n_elements, 3, 6))  # 形状为 (n_elements, 3, 6)
+        B[:, 0, 0] = dy[:, 0]  # B11
+        B[:, 0, 2] = dy[:, 1]  # B13
+        B[:, 0, 4] = dy[:, 2]  # B15
+        B[:, 1, 1] = dx[:, 0]  # B22
+        B[:, 1, 3] = dx[:, 1]  # B24
+        B[:, 1, 5] = dx[:, 2]  # B26
+        B[:, 2, 0] = dx[:, 0]  # B31
+        B[:, 2, 1] = dy[:, 0]  # B32
+        B[:, 2, 2] = dx[:, 1]  # B33
+        B[:, 2, 3] = dy[:, 1]  # B34
+        B[:, 2, 4] = dx[:, 2]  # B35
+        B[:, 2, 5] = dy[:, 2]  # B36
+
+        # 乘以因子
+        self.B = B * factor[:, None, None]  # 形状为 (n_elements, 3, 6)
+
+        return self.B
 
     def compute_constitutive_matrix(self):
         """
         计算本构矩阵 D
         """
-        Young_modulus = self.Young_modulus  # 杨氏模量
-        Poisson_ratio = self.Poisson_ratio  # 泊松比
+        ele_Nodes = self.nodes[self.elements]
+        n_elements = ele_Nodes.shape[0]
 
-        lmbd = Young_modulus * Poisson_ratio / ((1 + Poisson_ratio) * (1 - 2 * Poisson_ratio))
-        mu = Young_modulus / (2 * (1 + Poisson_ratio))
+        # 提取节点坐标
+        # Nodes 形状为 (n_elements, 3, 2)
+        x = ele_Nodes[:, :, 0]  # 形状为 (n_elements, 3)
+        y = ele_Nodes[:, :, 1]  # 形状为 (n_elements, 3)
 
-        D = np.array([[lmbd + 2 * mu, lmbd, 0],
-                      [lmbd, lmbd + 2 * mu, 0],
-                      [0, 0, mu]])
-        return D
+        if self.lmbd_func is None:
+            lmbd = self.lmbd * np.ones(ele_Nodes.shape[0])  # 形状为 (n_elements, )
+        else:
+            lmbd = self.lmbd_func(self.stresses, self.strains)
+
+        if self.mu_func is None:
+            mu = self.mu * np.ones(ele_Nodes.shape[0])  # 形状为 (n_elements, )
+        else:
+            mu = self.mu_func(self.stresses, self.strains)
+
+
+        self.D = np.zeros((n_elements, 3, 3))  # 形状为 (n_elements, 3, 3)
+        self.D[:, 0, 0] = lmbd + 2 * mu
+        self.D[:, 0, 1] = lmbd
+        self.D[:, 1, 0] = lmbd
+        self.D[:, 1, 1] = lmbd + 2 * mu
+        self.D[:, 2, 2] = mu
+
+        return self.D
 
     def compute_element_stiffness(self, B, D, Area):
         """
         计算单元刚度矩阵
         """
-        return np.dot(np.dot(B.T, D), B) * Area  # 曾出错误：忘记 × 面积
+        Area = Area.reshape(-1, 1, 1)
+        Ke = np.einsum('nji,njk,nkl->nil', B, D, B) * Area  # 形状为 (n_elements, 6, 6)
 
-    def generate_stiffness_matrix(self, Displacements_bc):
+        return Ke  # 曾出错误：忘记 × 面积
+
+    def generate_stiffness_matrix(self):
         """
-        生成总刚度矩阵 K_mat，并根据位移边界条件修改刚度矩阵 K
-        K_mat 的 type 是 scipy.sparse._csr.csr_matrix，方便进行算数运算和矢量积运算
+        生成总刚度矩阵
         """
         start = time.time()
-        num_dofs = self.num_nodes * 2  # 自由度总数
-        K_mat = lil_matrix((num_dofs, num_dofs))
+        num_dofs = self.nodes.shape[0] * 2  # 自由度总数
+        element_nodes = self.nodes[self.elements]  # 形状为 (n_elements, 3, 2)
 
-        for element in self.elements:
-            node_ids = element
-            element_nodes = self.nodes[node_ids]
+        # 批量计算所有单元的刚度矩阵
+        area = self.compute_element_area(element_nodes)[1]
+        Ke = self.compute_element_stiffness(self.B, self.D, area)  # Ke 形状为 (n_elements, 6, 6)
 
-            # 计算单元刚度矩阵
-            B, area = self.compute_B_matrix(element_nodes)
-            D = self.compute_constitutive_matrix()
-            Ke = self.compute_element_stiffness(B, D, area)
+        # 计算全局自由度索引
+        node_ids = self.elements  # 形状为 (n_elements, 3)
+        rows_K = np.repeat(node_ids * 2, 2, axis=1) + np.tile([0, 1], 3)  # 形状为 (n_elements, 6)
+        cols_K = np.repeat(node_ids * 2, 2, axis=1) + np.tile([0, 1], 3)  # 形状为 (n_elements, 6)
 
-            # 将单元刚度矩阵装配到全局刚度矩阵中
-            rows_K = np.repeat(node_ids * 2, 2) + np.tile([0, 1], 3)
-            cols_K = np.repeat(node_ids * 2, 2) + np.tile([0, 1], 3)
+        # 将单元刚度矩阵展平为 COO 格式
+        rows = rows_K.repeat(6, axis=1).flatten()  # 形状为 (n_elements * 36,)
+        cols = cols_K.repeat(6, axis=0).flatten()  # 形状为 (n_elements * 36,)
+        data = Ke.flatten()  # 形状为 (n_elements * 36,)
 
-            rows_Ke = np.arange(6)
-            cols_Ke = np.arange(6)
-
-            K_mat[np.ix_(rows_K, cols_K)] += Ke[np.ix_(rows_Ke, cols_Ke)]
+        # 使用 COO 格式装配全局刚度矩阵
+        K_mat = coo_matrix((data, (rows, cols)), shape=(num_dofs, num_dofs))
 
         # 施加边界条件
-        for node_id, node_displacement in Displacements_bc.items():
-            r = node_id * 2
-            c = node_id * 2
+        K_mat = K_mat.tolil()
+        disp_ids = self.ess_bc[:, 0].astype(int)
+        disp1 = self.ess_bc[:, 1]
+        disp2 = self.ess_bc[:, 2]
+        disp_rows = disp_ids * 2
+        disp_cols = disp_ids * 2
+        valid_disp1 = ~np.isnan(disp1)
+        valid_disp2 = ~np.isnan(disp2)
+        K_mat[disp_rows[valid_disp1], disp_cols[valid_disp1]] = self.penalty
+        K_mat[disp_rows[valid_disp2] + 1, disp_cols[valid_disp2] + 1] = self.penalty
 
-            # 相应主元素置大数
-            for i in range(2):
-                if node_displacement[i] is not None:
-                    K_mat[r + i, c + i] = self.penalty
+        self.K_mat = K_mat.tocsc()
 
         end = time.time()
         t = end - start
         print(f'生成刚度矩阵耗时: {t:.4e}s')
 
-        return K_mat.tocsr()  # 转换回CSR（压缩稀疏列矩阵）格式
-
-    def compute_element_body_loads(self, Element, Area):
+    def generate_body_force(self,
+                            bx_func=lambda x, y: 0 * x * y,
+                            by_func=lambda x, y: 0 * x * y):
         """
         计算单元体力荷载向量
-            b_x: float
-                体力 x 方向分量
-            b_y: float
-                体力 y 方向分量
         """
-        nodes_ele = self.nodes[Element]
-        X_ele = nodes_ele[:, 0].reshape(-1, 1)
-        Y_ele = nodes_ele[:, 1].reshape(-1, 1)
-        b_x = 0.
-        b_y = 0.
+        element_nodes = self.nodes[self.elements]
+        X_ele = element_nodes[:, :, 0]
+        Y_ele = element_nodes[:, :, 1]
 
-        # 设置体积力荷载向量
-        ele_body_loads = np.array([])
-        for X, Y in zip(X_ele, Y_ele):
-            X = X.item()
-            Y = Y.item()
-            ele_body_loads = np.append(ele_body_loads, (np.array([b_x, b_y]) * (Area / 3)))
-        return ele_body_loads.reshape(-1, 2)
+        # 计算体力分量
+        self.bx = np.vstack(
+            (self.bx, bx_func(X_ele, Y_ele) * self.area / 3)
+        )
+        self.by = np.vstack(
+            (self.by, by_func(X_ele, Y_ele) * self.area / 3)
+        )
 
-    def generate_loading_vector(self, Forces_bc, Displacements_bc):
+    def generate_loading_vector(self):
         """
         生成荷载向量
-            Forces_bc: dictionary
-                荷载边界条件，形如 {node_id: [fx, fy]}
-            Displacements_bc: dictionary
-                位移边界条件，形如 {node_id: [u, v]}
         """
         start = time.time()
-        num_dofs = self.num_nodes * 2
-        Loading_vector = np.zeros(num_dofs)
 
-        for element in self.elements:
-            node_ids = element
-            element_nodes = self.nodes[node_ids]
-
-            # 计算单元体力荷载
-            B, area = self.compute_B_matrix(element_nodes)
-            b_e = self.compute_element_body_loads(node_ids, area)
-
-            # 将单元体力荷载装配到全局体力荷载向量中
-            for i in range(3):
-                for j in range(2):
-                    r = node_ids[i] * 2 + j
-                    Loading_vector[r] += b_e[i, j]
+        bx_ids = self.elements * 2
+        by_ids = self.elements * 2 + 1
+        self.load_vector[bx_ids] += self.bx
+        self.load_vector[by_ids] += self.by
 
         # 处理加载边界条件
-        for node_id, node_force in Forces_bc.items():
-            row = node_id * 2
-            Loading_vector[row:row + 2] += node_force
+        if self.nat_bc.size != 0:
+            load_ids = self.nat_bc[:, 0].astype(int)
+            f_x = self.nat_bc[:, 1]
+            f_y = self.nat_bc[:, 2]
+            load_rows = load_ids * 2
+            self.load_vector[load_rows] += f_x
+            self.load_vector[load_rows + 1] += f_y
 
         # 处理位移边界条件
-        for node_id, node_displacement in Displacements_bc.items():
-            row = node_id * 2
-            for i in range(2):
-                if node_displacement[i] is not None:
-                    Loading_vector[row + i] = node_displacement[i] * self.penalty
+        if self.ess_bc.size != 0:
+            disp_ids = self.ess_bc[:, 0].astype(int)
+            disp1 = self.ess_bc[:, 1]
+            disp2 = self.ess_bc[:, 2]
+            disp_rows = disp_ids * 2
+
+            valid_disp1 = ~np.isnan(disp1)
+            valid_disp2 = ~np.isnan(disp2)
+
+            self.load_vector[disp_rows[valid_disp1]] = disp1[valid_disp1] * self.penalty
+            self.load_vector[disp_rows[valid_disp2] + 1] = disp2[valid_disp2] * self.penalty
 
         end = time.time()
         t = end - start
         print(f'计算荷载向量耗时: {t:.4e}s')
 
-        return Loading_vector
+        return self.load_vector
 
-    def solve(self, save_path=f'./solutions/sol_{label}.npz'):
+    def solve(self, save_tag=True, save_path=f'./solutions/sol_{label}.npz'):
         """
         求解位移、应力、应变
-        K_mat 的 type 是压缩稀疏列矩阵 scipy.sparse._csr.csr_matrix，方便进行算数运算和矢量积运算
-        Loads_bc 形如 {node_id: [fx, fy]}
-        Displacements_bc 形如 {node_id: [u, v]}
-        Strains 的形状是 (num_nodes, 3)，type 是 numpy.ndarray
-        Stresses 的形状是 (num_nodes, 3)，type 是 numpy.ndarray
         """
-        Forces_bc = self.nat_bc
-        Displacements_bc = self.ess_bc
         print('------------------------计算开始------------------------')
         start = time.time()
-        Loading_vector = self.generate_loading_vector(Forces_bc, Displacements_bc)
-        K_mat = self.generate_stiffness_matrix(Displacements_bc)
-        Stresses = np.zeros((len(self.elements), 3))
-        Strains = np.zeros((len(self.elements), 3))
 
         # 求解位移向量
-        Displacements = spsolve(K_mat, Loading_vector)
-
-        # 计算应力和应变
-        for elem_idx, element in enumerate(self.elements):
-            node_idx = element
-            element_nodes = self.nodes[node_idx]
-            B, area = self.compute_B_matrix(element_nodes)
-            D = self.compute_constitutive_matrix()
-            # 获取单元节点的位移
-            displacements_element = np.zeros(6)
-            for i in range(3):
-                displacements_element[i * 2:i * 2 + 2] = Displacements[2 * node_idx[i]: 2 * node_idx[i] + 2]
-            # 计算单元应变
-            element_strain = np.dot(B, displacements_element)
-            # 计算单元应力
-            element_stress = np.dot(D, element_strain)
-            # 存储单元应力和应变
-            Strains[elem_idx, :] = element_strain
-            Stresses[elem_idx, :] = element_stress
+        delta_disp = spsolve(self.K_mat, self.load_vector)
 
         end = time.time()
         t = end - start
         print(f'计算结束，共耗时: {t:.4e}s')
 
-        np.savez(save_path, array1=self.nodes, array2=self.elements, array3=Displacements, array4=Stresses, array5=Strains)
-        return Displacements, Stresses, Strains
+        # 计算应力和应变
+        delta_disp_reshaped = delta_disp.reshape(-1, 2)
+        delta_disp_ele = delta_disp_reshaped[self.elements].reshape(self.num_elements, 6)
 
-    def plot_deformed_shapes(self, Displacements, scale_factor=10., savefig=False):
-        Displacements = Displacements.reshape(-1, 2)
+        delta_strains = np.einsum('ijk,ik->ij', self.B, delta_disp_ele)  # 形状为 (n_elements, 3)
+        delta_stresses = np.einsum('ijk,ik->ij', self.D, delta_strains)  # 形状为 (n_elements, 3)
+
+        self.displacements += delta_disp
+        self.strains += delta_strains
+        self.stresses += delta_stresses
+
+        if save_tag:
+            np.savez(
+                save_path,
+                array1=self.nodes, array2=self.elements,
+                array3=self.displacements, array4=self.stresses, array5=self.strains
+            )
+
+        return self.displacements, self.stresses, self.strains
+
+    def plot_deformed_shapes(self, scale_factor=10., savefig=False):
+        Displacements = self.displacements.reshape(-1, 2)
         fig = plt.figure()
         for elem in self.elements:
             node_ids = elem
@@ -383,17 +440,15 @@ class LinearProblem2D:
         if savefig:
             fig.savefig(f'./figures/fig_deformed_{label}.png', dpi=300, bbox_inches='tight', format='png', transparent=False)
 
-    def plot_displacement(self, Displacements, savefig=False):
+    def plot_displacement(self, savefig=False):
         # 分离 x 方向和 y 方向的位移
-        displacement_x = Displacements[::2]
-        displacement_y = Displacements[1::2]
+        displacement_x = self.displacements[::2]
+        displacement_y = self.displacements[1::2]
 
         # 创建网格
         X_plot = self.nodes[:, 0]
         Y_plot = self.nodes[:, 1]
-
-        # 假设你有一个掩膜函数来确定哪些三角形需要掩膜
-        # 这里提供一个示例函数，可以根据实际情况进行调整
+        
         polygon = Polygon(self.boundary_nodes)
 
         def is_triangle_inside():
@@ -441,16 +496,28 @@ class LinearProblem2D:
         if savefig:
             fig.savefig(f'./figures/fig_disp_{label}.png', dpi=300, bbox_inches='tight', format='png', transparent=False)
 
-    def plot_stress(self, Stresses, savefig=False):
-        Sig_x = Stresses[:, 0]
-        Sig_y = Stresses[:, 1]
-        Tau_xy = Stresses[:, 2]
+    def plot_stress(self, savefig=False, x_target=0, y_target=0):
+        Sig_x = self.stresses[:, 0]
+        print(np.max(Sig_x) - np.min(Sig_x), np.mean(Sig_x), np.std(Sig_x))
+        Sig_y = self.stresses[:, 1]
+        Tau_xy = self.stresses[:, 2]
 
         # 提取三角形的顶点坐标
         ele = self.elements
         xy = self.nodes
         x_coords = xy[:, 0]
         y_coords = xy[:, 1]
+
+        # 找到距离目标点最近的节点
+        distances = np.sqrt((x_coords - x_target) ** 2 + (y_coords - y_target) ** 2)
+        nearest_node_idx = np.argmin(distances)  # 最近节点的索引
+        nearest_node_x = x_coords[nearest_node_idx]
+        nearest_node_y = y_coords[nearest_node_idx]
+        nearest_node_Sig_x = Sig_x[nearest_node_idx]
+
+        # 输出最近节点的 Tau_xy 值
+        print(f"Nearest node to ({x_target}, {y_target}) is ({nearest_node_x}, {nearest_node_y})")
+        print(f"Sig_x at this node: {nearest_node_Sig_x}")
 
         # 绘制三角形的伪彩色图
         fig = plt.figure(figsize=(16.6, 5))
@@ -485,10 +552,10 @@ class LinearProblem2D:
         if savefig:
             fig.savefig(f'./figures/fig_stress_{label}.png', dpi=300, bbox_inches='tight', format='png', transparent=False)
 
-    def plot_strain(self, Strains, savefig=False):
-        e_xx = Strains[:, 0]
-        e_yy = Strains[:, 1]
-        e_xy = Strains[:, 2] * 0.5
+    def plot_strain(self, savefig=False):
+        e_xx = self.strains[:, 0]
+        e_yy = self.strains[:, 1]
+        e_xy = self.strains[:, 2] * 0.5
 
         # 提取三角形的顶点坐标
         ele = self.elements
@@ -540,13 +607,23 @@ boundary_nodes = np.array([
 if __name__ == '__main__':
     E = 100.
     nu = 0.3
-    w = 1e+4  # 罚数
+    w = 1e+16  # 罚数
 
     # 求解
     sol_path = f'solutions/sol_{label}.npz'
     linear_problem = LinearProblem2D(boundary_nodes, E, nu, penalty=w, max_area=1e-4)
 
     linear_problem.set_elements()
+    linear_problem.compute_B_matrix()
+    linear_problem.compute_constitutive_matrix()
+
+
+    def load_boundary_0(in_feature):
+        return in_feature == 0.
+
+
+    def load_boundary_1(in_feature):
+        return in_feature == 1.
 
 
     class u_function:
@@ -557,14 +634,18 @@ if __name__ == '__main__':
             self.h = 1.
             self.l = 1.
 
-        def __call__(self, in_feature1, in_feature2):
+        def __call__(self, x, y):
+            P = self.P
+            I = self.I
+            G = self.G
+            h = self.h
+            l = self.l
             return (
-                    (-self.P / (2 * E * self.I)) * in_feature1 ** 2 * (in_feature2 - 0.5)
-                    - (nu * self.P / (6 * E * self.I)) * (in_feature2 - 0.5) ** 3
-                    + (self.P / (6 * self.G * self.I)) * (in_feature2 - 0.5) ** 3
-                    - (self.P * self.h ** 2 / (8 * self.G * self.I) - self.P * self.l ** 2 / (2 * E * self.I)) * (in_feature2 - 0.5)
+                    (-P / (2 * E * I)) * x ** 2 * (y - 0.5)
+                    - (nu * P / (6 * E * I)) * (y - 0.5) ** 3
+                    + (P / (6 * G * I)) * (y - 0.5) ** 3
+                    - (P * h ** 2 / (8 * G * I) - P * l ** 2 / (2 * E * I)) * (y - 0.5)
             )
-
 
     class v_function:
         def __init__(self, ):
@@ -574,24 +655,37 @@ if __name__ == '__main__':
             self.h = 1.
             self.l = 1.
 
-        def __call__(self, in_feature1, in_feature2):
+        def __call__(self, x, y):
+            P = self.P
+            I = self.I
+            G = self.G
+            h = self.h
+            l = self.l
             return (
-                    (nu * self.P / (2 * E * self.I)) * in_feature1 * (in_feature2 - 0.5) ** 2
-                    + (self.P / (6 * E * self.I)) * in_feature1 ** 3
-                    - (self.P * self.l ** 2 / (2 * E * self.I) * in_feature1)
-                    + (self.P * self.l ** 3 / (3 * E * self.I))
+                    (nu * P / (2 * E * I)) * x * (y - 0.5) ** 2
+                    + (P / (6 * E * I)) * x ** 3
+                    - (P * l ** 2 / (2 * E * I) * x)
+                    + (P * l ** 3 / (3 * E * I))
             )
 
 
     u_func = u_function()
     v_func = v_function()
 
-    linear_problem.generate_essential_condition(disp1_func=u_func, disp2_func=v_func)
-    linear_problem.generate_natural_condition()
-    displacement, stress, strain = linear_problem.solve(save_path=sol_path)
+    linear_problem.generate_body_force()
+    linear_problem.generate_essential_condition(disp1_func=u_func,
+                                                disp2_func=v_func,
+                                                x_condition=load_boundary_1)
+    linear_problem.generate_essential_condition(disp1_func=u_func,
+                                                disp2_func=v_func,
+                                                x_condition=load_boundary_0, )
+    linear_problem.generate_stiffness_matrix()
+    linear_problem.generate_loading_vector()
+
+    linear_problem.solve(save_tag=True, save_path=sol_path)
 
     # 绘图
-    # linear_problem.plot_deformed_shapes(displacement, scale_factor=0.1, savefig=False)
-    linear_problem.plot_displacement(displacement, savefig=False)
-    linear_problem.plot_stress(stress, savefig=False)
-    linear_problem.plot_strain(strain, savefig=False)
+    # linear_problem.plot_deformed_shapes(scale_factor=0.1, savefig=False)
+    linear_problem.plot_displacement(savefig=False)
+    linear_problem.plot_stress(savefig=False)
+    # linear_problem.plot_strain(savefig=False)
