@@ -276,7 +276,7 @@ class LinearProblem2D:
         Area = Area.reshape(-1, 1, 1)
         Ke = np.einsum('nji,njk,nkl->nil', B, D, B) * Area  # 形状为 (n_elements, 6, 6)
 
-        return Ke  # 曾出错误：忘记 × 面积
+        return Ke 
 
     def generate_stiffness_matrix(self):
         """
@@ -421,11 +421,9 @@ class LinearProblem2D:
             disp = Displacements[node_ids]
             deformed_coords = original_coords + scale_factor * disp
 
-            # Plot original shape
             plt.plot(np.append(original_coords[:, 0], original_coords[0, 0]),
                      np.append(original_coords[:, 1], original_coords[0, 1]), 'r--')
 
-            # Plot deformed shape
             plt.plot(np.append(deformed_coords[:, 0], deformed_coords[0, 0]),
                      np.append(deformed_coords[:, 1], deformed_coords[0, 1]), 'b-')
 
@@ -438,53 +436,46 @@ class LinearProblem2D:
         plt.show()
 
         if savefig:
-            fig.savefig(f'./figures/fig_deformed_{label}.png', dpi=300, bbox_inches='tight', format='png', transparent=False)
+            fig.savefig(f'./figures/fig_deformed_{label}.png', dpi=300, bbox_inches='tight', format='png',
+                        transparent=False)
 
     def plot_displacement(self, savefig=False):
-        # 分离 x 方向和 y 方向的位移
         displacement_x = self.displacements[::2]
         displacement_y = self.displacements[1::2]
 
-        # 创建网格
         X_plot = self.nodes[:, 0]
         Y_plot = self.nodes[:, 1]
-        
-        polygon = Polygon(self.boundary_nodes)
+
+        polygon = Polygon(boundary_nodes)
 
         def is_triangle_inside():
             inside_mask = np.ones(triangles.shape[0], dtype=bool)
             for i, tri_idx in enumerate(triangles):
-                x_coords = X_plot[tri_idx]
-                y_coords = Y_plot[tri_idx]
-                centroid = Point(np.mean(x_coords), np.mean(y_coords))
+                coord1 = X_plot[tri_idx]
+                coord2 = Y_plot[tri_idx]
+                centroid = Point(np.mean(coord1), np.mean(coord2))
                 if polygon.contains(centroid):
                     inside_mask[i] = False
             return inside_mask
 
-        # 创建三角剖分
         Tri = tri.Triangulation(X_plot, Y_plot)
-
-        # 获取三角形数据
-        triangles = Tri.triangles
-
-        # 应用掩膜
-        mask = is_triangle_inside()
+        triangles = Tri.triangles 
+        mask = is_triangle_inside() 
         Tri.set_mask(mask)
 
-        # 绘制位移图
         fig = plt.figure(figsize=(11.5, 5))
 
         plt.subplot(1, 2, 1)
-        sc = plt.tripcolor(Tri, displacement_x, cmap='jet')
-        plt.colorbar(sc)
+        plt.tricontourf(Tri, displacement_x, cmap='jet', levels=100)
+        plt.colorbar()
         plt.axis('equal')
         plt.title('Displacement u')
         plt.xlabel('x')
         plt.ylabel('y')
 
         plt.subplot(1, 2, 2)
-        sc = plt.tripcolor(Tri, displacement_y, cmap='jet')
-        plt.colorbar(sc)
+        plt.tricontourf(Tri, displacement_y, cmap='jet', levels=100)
+        plt.colorbar()
         plt.axis('equal')
         plt.title('Displacement v')
         plt.xlabel('x')
@@ -494,20 +485,19 @@ class LinearProblem2D:
         plt.show()
 
         if savefig:
-            fig.savefig(f'./figures/fig_disp_{label}.png', dpi=300, bbox_inches='tight', format='png', transparent=False)
+            fig.savefig(f'./figures/fig_disp_{label}.png', dpi=300, bbox_inches='tight', format='png',
+                        transparent=False)
 
     def plot_stress(self, savefig=False, x_target=0, y_target=0):
         Sig_x = self.stresses[:, 0]
         Sig_y = self.stresses[:, 1]
         Tau_xy = self.stresses[:, 2]
 
-        # 提取三角形的顶点坐标
         ele = self.elements
         xy = self.nodes
         x_coords = xy[:, 0]
         y_coords = xy[:, 1]
 
-        # 绘制三角形的伪彩色图
         fig = plt.figure(figsize=(16.6, 5))
 
         plt.subplot(1, 3, 1)
@@ -538,20 +528,19 @@ class LinearProblem2D:
         plt.show()
 
         if savefig:
-            fig.savefig(f'./figures/fig_stress_{label}.png', dpi=300, bbox_inches='tight', format='png', transparent=False)
+            fig.savefig(f'./figures/fig_stress_{label}.png', dpi=300, bbox_inches='tight', format='png',
+                        transparent=False)
 
     def plot_strain(self, savefig=False):
         e_xx = self.strains[:, 0]
         e_yy = self.strains[:, 1]
         e_xy = self.strains[:, 2] * 0.5
 
-        # 提取三角形的顶点坐标
         ele = self.elements
         xy = self.nodes
         x_coords = xy[:, 0]
         y_coords = xy[:, 1]
 
-        # 绘制三角形的伪彩色图
         fig = plt.figure(figsize=(16.9, 5))
 
         plt.subplot(1, 3, 1)
@@ -582,7 +571,8 @@ class LinearProblem2D:
         plt.show()
 
         if savefig:
-            fig.savefig(f'./figures/fig_strain_{label}.png', dpi=300, bbox_inches='tight', format='png', transparent=False)
+            fig.savefig(f'./figures/fig_strain_{label}.png', dpi=300, bbox_inches='tight', format='png',
+                        transparent=False)
 
 
 boundary_nodes = np.array([
