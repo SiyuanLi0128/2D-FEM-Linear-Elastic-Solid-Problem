@@ -110,11 +110,14 @@ def plot_stress(Nodes, Elements, Stresses, savefig=False, figType='element'):
     s_yy = np.zeros(Nodes.shape[0])
     s_xy = np.zeros(Nodes.shape[0])
 
-    for ele, sxx, syy, sxy in zip(Elements, sig_x, sig_y, tau_xy):
-        s_xx[ele] += sxx
-        s_yy[ele] += syy
-        s_xy[ele] += sxy
-        times[ele] += 1
+    ele_flat = Elements.flatten()
+    sig_x_expanded = np.repeat(sig_x, Elements.shape[1])
+    sig_y_expanded = np.repeat(sig_y, Elements.shape[1])
+    tau_xy_expanded = np.repeat(tau_xy, Elements.shape[1])
+    np.add.at(s_xx, ele_flat, sig_x_expanded)
+    np.add.at(s_yy, ele_flat, sig_y_expanded)
+    np.add.at(s_xy, ele_flat, tau_xy_expanded)
+    np.add.at(times, ele_flat, 1)
     s_xx = s_xx / times
     s_yy = s_yy / times
     s_xy = s_xy / times
@@ -221,16 +224,17 @@ def plot_strain(Nodes, Elements, Strains, savefig=False, figtype='element'):
     e_yy = np.zeros(Nodes.shape[0])
     e_xy = np.zeros(Nodes.shape[0])
 
-    for ele, exx, eyy, exy in zip(Elements, exx_ele, eyy_ele, exy_ele):
-        e_xx[ele] += exx
-        e_yy[ele] += eyy
-        e_xy[ele] += exy
-        times[ele] += 1
+    ele_flat = Elements.flatten()
+    exx_ele_expanded = np.repeat(exx_ele, Elements.shape[1])
+    eyy_ele_expanded = np.repeat(eyy_ele, Elements.shape[1])
+    exy_ele_expanded = np.repeat(exy_ele, Elements.shape[1])
+    np.add.at(e_xx, ele_flat, exx_ele_expanded)
+    np.add.at(e_yy, ele_flat, eyy_ele_expanded)
+    np.add.at(e_xy, ele_flat, exy_ele_expanded)
+    np.add.at(times, ele_flat, 1)
     e_xx = e_xx / times
     e_yy = e_yy / times
     e_xy = e_xy / times
-    # plt.plot(np.arange(times.shape[0]), times)
-    # plt.show()
 
     X_plot = x_coords.reshape(-1)
     Y_plot = y_coords.reshape(-1)
