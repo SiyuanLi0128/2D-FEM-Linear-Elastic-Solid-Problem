@@ -1,3 +1,5 @@
+Developed by Siyuan Li
+
 This educational solver demonstrates core Finite Element Method (FEM) principles for 2D linear elastic problems, providing a foundation for both academic instruction and future extension to nonlinear mechanics simulations.
 
 Key Features:
